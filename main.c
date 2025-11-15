@@ -2,10 +2,18 @@
 #include "xil_printf.h"
 #include "xil_exception.h"
 #include "xil_types.h"
+#include "xil_io.h"
 #include "xintc.h"
 #include "xparameters.h"
 #include "xtmrctr.h"
 #include "xgpio.h"
+
+#include "Pmod_Dual_MAXSONAR.h"
+#include "Pmod_DHB1.h"
+#include "MotorFeedback.h"
+#include "PWM.h"
+#include <stdint.h>
+//#include "Pmod_Dual_MAXSONAR.h"
 
 /*-------------------------------------------------------------------
 MEMORY MAPPINGS
@@ -20,6 +28,46 @@ MEMORY MAPPINGS
 #define PUSH_BTNS_REG (unsigned *)(PUSH_BTNS_BASE_ADDR)
 #define RGB_LEDS_BASE_ADDR (AXI_GPIO_1_BASE_ADDR)
 #define DIP_SWITCHES_BASE_ADDR (AXI_GPIO_1_BASE_ADDR + 8)       /* Not used */
+
+#define GPIO_BASEADDR     XPAR_PMOD_DHB1_0_GPIO_BASEADDR
+#define PWM_BASEADDR      XPAR_PMOD_DHB1_0_PWM_BASEADDR
+#define MOTOR_FB_BASEADDR XPAR_PMOD_DHB1_0_MOTOR_FB_BASEADDR
+
+/*-------------------------------------------------------------------
+MAIN CLOCK FREQUENCY
+-------------------------------------------------------------------*/
+#define CLK_FREQ 166666670
+
+/*-------------------------------------------------------------------
+SONAR
+-------------------------------------------------------------------*/
+PMOD_DUAL_MAXSONAR Sonar;
+#define PMOD_MAXSONAR_BASEADDR 0x44A00000
+
+#define SONAR_THRESHOLD_VALUE   68000
+
+/*-------------------------------------------------------------------
+INFRARED SENSORS
+-------------------------------------------------------------------*/
+#define INFRARED_SENSOR_BASE_ADDR   0x40020000
+
+#define LEFT_SENSOR                 0b01
+#define RIGHT_SENSOR                0b10
+
+/*-------------------------------------------------------------------
+DHB1 MOTOR CONTROLLER
+-------------------------------------------------------------------*/
+#define DHB1_GPIO                   0x44A10000
+#define DHB1_MOTOR_FB               0x44A20000
+#define DHB1_PWM                    0x44A30000
+
+#define PWM_PER              2
+#define SENSOR_EDGES_PER_REV 4
+#define GEARBOX_RATIO        48
+
+PmodDHB1 pmodDHB1;
+MotorFeedback motorFeedback;
+
 
 /* RGB LEDS */
 // Bitfields for manipulating individual LEDs
@@ -58,19 +106,6 @@ unsigned *tim0_tcsr = TIM_TCSR0_REG;
 unsigned *tim0_tlr = TIM_TLR0_REG;
 unsigned *tim0_tcr = TIM_TCR0_REG;
 
-// NEED A SECOND TIMER
-// PWM FREQUENCY: 2kHz
-// NEED a much higher timer frequency to get good pwm resolution
-// SET UP TIM1
-
-//PMOD MAXSONAR:
-// CAN RECEIVE DATA EITHER VIA UART, PWM, OR ANALOG
-// FIGURE OUT WHICH. PROBABLY UART?
-
-//PMOD LS1:
-// SENDS A DIGITAL 1 WHEN THE LIGHT IS ABOVE A CERTAIN THRESHOLD.
-// EZPZ, JUST MAKE IT AN INTERRUPT
-
 typedef enum 
 {ENUMERATE_ME} State; 
 
@@ -100,6 +135,7 @@ void setupTimer();
 XIntc InterruptController;  // Create an instance of the interrupt controller
 XTmrCtr TimerCounter;       // Create an instance of the Timer Counter
 XGpio gpio;                 // Create an instance of the gpio driver
+
 
 /*---------------------------------------------------------------------------------------
     gpioIntISR()
@@ -139,6 +175,56 @@ void TimerCounterISR(void *CallBackRef, u8 TmrCtrNumber) {
   }
 }
 
+/*---------------------------------------------------------------------------------------
+    getSonarDistance()
+
+        gets the raw sensor value from the two sonar sensors, averages it, then puts that
+        average into a simple moving average for filtering.
+
+---------------------------------------------------------------------------------------*/
+
+uint32_t getSonarDistance() {
+    static uint32_t movingAvgData[4] = {0};
+    static uint32_t staleIndex = 0;
+    static _Bool isFull = FALSE;
+
+    uint32_t dist = MAXSONAR_getDistance(&Sonar, 1);
+    uint32_t dist2 = MAXSONAR_getDistance(&Sonar, 2);
+
+    movingAvgData[staleIndex] = ((dist + dist2) / 2);
+    staleIndex = (staleIndex + 1) % 4;
+
+    if (staleIndex == 0) {
+        isFull = TRUE;
+    }
+
+    if (!isFull) {
+        return (SONAR_THRESHOLD_VALUE + 1000);
+    }
+    else {
+        uint32_t sma = 0;
+        for (int i = 0; i < 4; i++) {
+            sma += movingAvgData[i];
+        }
+        sma = sma / 4;
+        return sma;
+    }
+}
+
+/*---------------------------------------------------------------------------------------
+    readInfraredSensor()
+        Returns TRUE if the input sensor is detecting a reflective surface. Returns FALSE
+        otherwise.
+
+        Parameters:
+            sensor - either LEFT_SENSOR or RIGHT_SENSOR
+        
+
+---------------------------------------------------------------------------------------*/
+_Bool readInfraredSensor(uint8_t sensor) {
+    return ( *(volatile u32 *)(INFRARED_SENSOR_BASE_ADDR) & sensor );
+}
+
 
 /*---------------------------------------------------------------------------------------
     FSM_tick()
@@ -169,17 +255,54 @@ int main(void)
     // Buttons = inputs, LEDs = outputs
     *rgbLEDsTri = 0x0;
 
-    setupInterrupts();
-    setupTimer();
+//    setupInterrupts();
+//    setupTimer();
 
     state = 0;
     doOnce = 0;
+    MAXSONAR_begin(&Sonar, PMOD_MAXSONAR_BASEADDR, CLK_FREQ);
 
+    DHB1_begin(&pmodDHB1, DHB1_GPIO, DHB1_PWM, CLK_FREQ, PWM_PER);
+    MotorFeedback_init(&motorFeedback, DHB1_MOTOR_FB, CLK_FREQ,
+         SENSOR_EDGES_PER_REV, GEARBOX_RATIO);
+    DHB1_motorEnable(&pmodDHB1);
+
+    uint32_t dist;
+    _Bool leftSensor = FALSE;
+    _Bool rightSensor = TRUE;
+
+    DHB1_setDirs(&pmodDHB1, 0, 1); // Set direction forward
     // Infinite loop
+    DHB1_setMotorSpeeds(&pmodDHB1, 50, 50);
     while(1)
     {
         // cycle through traffic light pattern 
-        FSM_tick(); 
+        //FSM_tick(); 
+        dist = getSonarDistance();
+        if (dist < SONAR_THRESHOLD_VALUE) {
+            *rgbLEDsData = 04444;
+        }
+
+        leftSensor = readInfraredSensor(LEFT_SENSOR);
+        //if (leftSensor) { xil_printf("left: TRUE  ");} else { xil_printf("left: FALSE  ");}
+
+        rightSensor = readInfraredSensor(RIGHT_SENSOR);
+        //if (rightSensor) { xil_printf("right: TRUE\r\n");} else { xil_printf("right: FALSE\r\n");}
+        
+        
+        int b = 0;
+        int a = 0;
+        int c = 0;
+        for (int i = 0; i < 50000; i++) {
+            a = i;
+            b = i + a;
+            c = i + b;
+            a = c;
+            if (i % 500 == 0) {
+                asm("nop");
+            }
+            
+        }
 
     }
     return 0;
