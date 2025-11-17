@@ -13,7 +13,6 @@
 #include "MotorFeedback.h"
 #include "PWM.h"
 #include <stdint.h>
-//#include "Pmod_Dual_MAXSONAR.h"
 
 /*-------------------------------------------------------------------
 MEMORY MAPPINGS
@@ -29,22 +28,19 @@ MEMORY MAPPINGS
 #define RGB_LEDS_BASE_ADDR (AXI_GPIO_1_BASE_ADDR)
 #define DIP_SWITCHES_BASE_ADDR (AXI_GPIO_1_BASE_ADDR + 8)       /* Not used */
 
-#define GPIO_BASEADDR     XPAR_PMOD_DHB1_0_GPIO_BASEADDR
-#define PWM_BASEADDR      XPAR_PMOD_DHB1_0_PWM_BASEADDR
-#define MOTOR_FB_BASEADDR XPAR_PMOD_DHB1_0_MOTOR_FB_BASEADDR
-
 /*-------------------------------------------------------------------
 MAIN CLOCK FREQUENCY
 -------------------------------------------------------------------*/
-#define CLK_FREQ 166666670
+#define CLK_FREQ_HZ                 166666670
 
 /*-------------------------------------------------------------------
 SONAR
 -------------------------------------------------------------------*/
-PMOD_DUAL_MAXSONAR Sonar;
-#define PMOD_MAXSONAR_BASEADDR 0x44A00000
+#define PMOD_MAXSONAR_BASEADDR      0x44A00000
 
-#define SONAR_THRESHOLD_VALUE   68000
+#define SONAR_THRESHOLD_VALUE       68000
+
+PMOD_DUAL_MAXSONAR Sonar;
 
 /*-------------------------------------------------------------------
 INFRARED SENSORS
@@ -61,25 +57,32 @@ DHB1 MOTOR CONTROLLER
 #define DHB1_MOTOR_FB               0x44A20000
 #define DHB1_PWM                    0x44A30000
 
-#define PWM_PER              2
-#define SENSOR_EDGES_PER_REV 4
-#define GEARBOX_RATIO        48
+#define PWM_PER                     2
+#define SENSOR_EDGES_PER_REV        4
+#define GEARBOX_RATIO               48
 
 PmodDHB1 pmodDHB1;
 MotorFeedback motorFeedback;
 
-
-/* RGB LEDS */
+/*-------------------------------------------------------------------
+RGB LEDS
+-------------------------------------------------------------------*/
 // Bitfields for manipulating individual LEDs
-#define RGB_LD0 0b000000000111
-#define RGB_LD1 0b000000111000
-#define RGB_LD2 0b000111000000
-#define RGB_LD3 0b111000000000
+#define RGB_LD0                     0b000000000111
+#define RGB_LD1                     0b000000111000
+#define RGB_LD2                     0b000111000000
+#define RGB_LD3                     0b111000000000
 
-#define RGB_LED_ALL_RED         0b100100100100
-#define RGB_LED_ALL_GREEN       0b010010010010
-#define RGB_LED_ALL_OFF         0b000000000000
+#define RGB_LED_ALL_RED             0b100100100100
+#define RGB_LED_ALL_GREEN           0b010010010010
+#define RGB_LED_ALL_OFF             0b000000000000
 
+unsigned *rgbLEDsData = RGB_LEDS_BASE_ADDR;
+unsigned *rgbLEDsTri = RGB_LEDS_BASE_ADDR + 1;
+
+/*-------------------------------------------------------------------
+INTERRUPTS
+-------------------------------------------------------------------*/
 #define INT_CONTROLLER_BASE_ADDR    0x41200000
 #define INTC_DEVICE_ID              0
 #define TMRCTR_DEVICE_ID            0
@@ -87,7 +90,9 @@ MotorFeedback motorFeedback;
 #define INTC_GPIO_INT_ID            XPAR_FABRIC_XGPIO_0_INTR
 #define TIMER_0                     XTC_TIMER_0
 
-/* TIMERS */
+/*-------------------------------------------------------------------
+TIMERS
+-------------------------------------------------------------------*/
 #define TIM_BASE_ADDR           0x41C00000
 #define TIM_TCSR0_REG           (TIM_BASE_ADDR + 0x0)   // Control and Status Register
 #define TIM_TLR0_REG            (TIM_BASE_ADDR + 0x4)   // Load Register
@@ -106,29 +111,36 @@ unsigned *tim0_tcsr = TIM_TCSR0_REG;
 unsigned *tim0_tlr = TIM_TLR0_REG;
 unsigned *tim0_tcr = TIM_TCR0_REG;
 
-typedef enum 
-{ENUMERATE_ME} State; 
+/*-------------------------------------------------------------------
+SYSTEM STATE
+-------------------------------------------------------------------*/
+typedef enum {
+    STARTUP,
+    LINE_FOLLOWING,
+    SONAR_STOPPED
+} State; 
 
 // Create state variable
-State state;
+State state = STARTUP;
 
 // Data and tristate register ptrs for the 4 push buttons on the Arty board
 //unsigned *buttonsData = PUSH_BTNS_REG;
 //unsigned *buttonsTri = PUSH_BTNS_REG + 1;
-unsigned *rgbLEDsData = RGB_LEDS_BASE_ADDR;
-unsigned *rgbLEDsTri = RGB_LEDS_BASE_ADDR + 1;
 
 static unsigned int doOnce = 0;
 static unsigned long int globalTimestamp = 0;       // in ms
-static unsigned long int redStateTimeout = 0;
-static unsigned long int flashingRedStateTimeout = 0;
-static int flashingRedStateIterator = 0; 
 
 static _Bool buttonPressed = 0;
 static unsigned long int buttonPressDbnceTimeout = 0;
 
-void executionFailed();
+// SONAR DISTANCE SENSORS
+uint32_t sonarDist;
 
+// INFRARED LINE SENSORS
+_Bool leftSensor = FALSE;
+_Bool rightSensor = FALSE;
+
+void executionFailed();
 void setupInterrupts();
 void setupTimer();
 
@@ -236,8 +248,43 @@ void FSM_tick()
 { 
   switch(state) 
   { 
-    case 0: 
-      break; 
+    case STARTUP:
+        if (!doOnce) {
+            // Dwell for 5 seconds on startup;
+            while (globalTimestamp < 5000) {
+                // Make a LED countdown to robot start. Think like the countdown light
+                // in a drag race
+                if (globalTimestamp < 2500) {
+                    // Set LD2 Red
+                    *rgbLEDsData = (RGB_LD2 & RGB_LED_ALL_RED);
+                }
+                else {
+                    // Set LD1 Yellow
+                    *rgbLEDsData = (RGB_LD1 & (RGB_LED_ALL_RED | RGB_LED_ALL_GREEN));
+                }
+                
+            }
+            // Set LD0 Green
+            *rgbLEDsData = (RGB_LD0 & RGB_LED_ALL_GREEN);
+            doOnce = true;
+        }
+        // Start with one sensor on the line.
+        // Rotate the opposite direction until no longer reading the line, start timer.
+        // Time until the other sensor reads the line.
+        // Divide that time by two, and turn back for half that time.
+        // Robot should now be 'straight' on the line
+
+        break;
+
+    case LINE_FOLLOWING:
+        break;
+
+    case SONAR_STOPPED:
+        break;
+    
+    default:
+        break;
+
   } 
 }
 
@@ -255,31 +302,31 @@ int main(void)
     // Buttons = inputs, LEDs = outputs
     *rgbLEDsTri = 0x0;
 
-//    setupInterrupts();
-//    setupTimer();
+    setupInterrupts();
+    setupTimer();
 
-    state = 0;
+    state = STARTUP;
     doOnce = 0;
-    MAXSONAR_begin(&Sonar, PMOD_MAXSONAR_BASEADDR, CLK_FREQ);
+    MAXSONAR_begin(&Sonar, PMOD_MAXSONAR_BASEADDR, CLK_FREQ_HZ);
 
-    DHB1_begin(&pmodDHB1, DHB1_GPIO, DHB1_PWM, CLK_FREQ, PWM_PER);
-    MotorFeedback_init(&motorFeedback, DHB1_MOTOR_FB, CLK_FREQ,
+    DHB1_begin(&pmodDHB1, DHB1_GPIO, DHB1_PWM, CLK_FREQ_HZ, PWM_PER);
+    MotorFeedback_init(&motorFeedback, DHB1_MOTOR_FB, CLK_FREQ_HZ,
          SENSOR_EDGES_PER_REV, GEARBOX_RATIO);
     DHB1_motorEnable(&pmodDHB1);
 
-    uint32_t dist;
-    _Bool leftSensor = FALSE;
-    _Bool rightSensor = TRUE;
-
     DHB1_setDirs(&pmodDHB1, 0, 1); // Set direction forward
+
     // Infinite loop
-    DHB1_setMotorSpeeds(&pmodDHB1, 50, 50);
+    //DHB1_setMotorSpeeds(&pmodDHB1, 50, 50);
     while(1)
     {
-        // cycle through traffic light pattern 
-        //FSM_tick(); 
-        dist = getSonarDistance();
-        if (dist < SONAR_THRESHOLD_VALUE) {
+        FSM_tick(); 
+
+        /*-------------------------------------------------------------------
+        DRIVER TESTS
+        -------------------------------------------------------------------*/
+        sonarDist = getSonarDistance();
+        if (sonarDist < SONAR_THRESHOLD_VALUE) {
             *rgbLEDsData = 04444;
         }
 
@@ -289,20 +336,7 @@ int main(void)
         rightSensor = readInfraredSensor(RIGHT_SENSOR);
         //if (rightSensor) { xil_printf("right: TRUE\r\n");} else { xil_printf("right: FALSE\r\n");}
         
-        
-        int b = 0;
-        int a = 0;
-        int c = 0;
-        for (int i = 0; i < 50000; i++) {
-            a = i;
-            b = i + a;
-            c = i + b;
-            a = c;
-            if (i % 500 == 0) {
-                asm("nop");
-            }
-            
-        }
+        /* TODO: TEST THAT TIMER IS APPROXIMATELY CORRECT */
 
     }
     return 0;
@@ -431,6 +465,10 @@ void setupTimer() {
     // This means the clock should reset every 1.0000003815ms
     // Set what value the timer should reset/init to (setting TLR0 indirectly)
     XTmrCtr_SetResetValue(&TimerCounter, TIMER_0, 81248);
+
+    // TODO!!!!: CHECK IF THE CLOCK IS GETTING THE NEW 166.667MHz clock
+    // If so, we need to call:
+    // XTmrCtr_SetResetValue(&TimerCounter, TIMER_0, 166667);
 
     // Start the timer
     XTmrCtr_Start(&TimerCounter, TIMER_0);
