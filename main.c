@@ -75,6 +75,7 @@ RGB LEDS
 
 #define RGB_LED_ALL_RED             0b100100100100
 #define RGB_LED_ALL_GREEN           0b010010010010
+#define RGB_LED_ALL_BLUE            0b001001001001
 #define RGB_LED_ALL_OFF             0b000000000000
 
 unsigned *rgbLEDsData = RGB_LEDS_BASE_ADDR;
@@ -116,6 +117,7 @@ SYSTEM STATE
 -------------------------------------------------------------------*/
 typedef enum {
     STARTUP,
+    CENTER_FINDING,
     LINE_FOLLOWING,
     SONAR_STOPPED
 } State; 
@@ -129,6 +131,14 @@ State state = STARTUP;
 
 static unsigned int doOnce = 0;
 static unsigned long int globalTimestamp = 0;       // in ms
+
+enum {
+    NO_LINE_DETECTED = 0,
+    LEFT_LINE_DETECTED = 1,
+    RIGHT_LINE_DETECTED = 2,
+    BOTH_LINES_DETECTED = 3
+}
+static uint8_t lineDetectionState = NO_LINE_DETECTED;
 
 static _Bool buttonPressed = 0;
 static unsigned long int buttonPressDbnceTimeout = 0;
@@ -169,6 +179,19 @@ void gpioIntISR(void *CallbackRef) {
         buttonPressed = 0;
     }
 
+}
+
+/*---------------------------------------------------------------------------------------
+    delayMs()
+
+        Waits until the specified number of milliseconds have passed
+        
+---------------------------------------------------------------------------------------*/
+void delayMs(unsigned long int delayTimeMs) {
+    unsigned long int targetTime = globalTimestamp + delayTimeMs;
+    while (globalTimestamp < targetTime) {
+        // wait
+    }
 }
 
 
@@ -241,11 +264,15 @@ _Bool readInfraredSensor(uint8_t sensor) {
 /*---------------------------------------------------------------------------------------
     FSM_tick()
 
-        Manages the Finite State machine for the robot
+        Manages the Finite State machine for the line following robot
 
 ---------------------------------------------------------------------------------------*/
 void FSM_tick() 
 { 
+
+    static unsigned long int lineFallingEdge_Ms = 0;
+    static _Bool prevLineReading = true;
+
   switch(state) 
   { 
     case STARTUP:
@@ -264,10 +291,30 @@ void FSM_tick()
                 }
                 
             }
-            // Set LD0 Green
-            *rgbLEDsData = (RGB_LD0 & RGB_LED_ALL_GREEN);
+            // Set LEDs all blue to indicate centering
+            *rgbLEDsData = RGB_LED_ALL_BLUE;
             doOnce = true;
         }
+
+        leftSensor = readInfraredSensor(LEFT_SENSOR);
+        rightSensor = readInfraredSensor(RIGHT_SENSOR);
+        
+        if (leftSensor && rightSensor) {
+            lineDetectionState = BOTH_LINES_DETECTED;
+            executionFailed(); // Error state
+        }
+        else if (leftSensor) {
+            lineDetectionState = LEFT_LINE_DETECTED;
+        }
+        else if (rightSensor) {
+            lineDetectionState = RIGHT_LINE_DETECTED;
+        }
+        else {
+            lineDetectionState = NO_LINE_DETECTED;
+        }
+
+        state = CENTER_FINDING;
+        doOnce = 0;
         // Start with one sensor on the line.
         // Rotate the opposite direction until no longer reading the line, start timer.
         // Time until the other sensor reads the line.
@@ -276,16 +323,171 @@ void FSM_tick()
 
         break;
 
+    case CENTER_FINDING:
+
+        if (!doOnce) {
+            if (lineDetectionState == LEFT_LINE_DETECTED) {
+                DHB1_setDirs(&pmodDHB1, 1, 1); // left turn
+            }
+            else if (lineDetectionState == RIGHT_LINE_DETECTED) {
+                DHB1_setDirs(&pmodDHB1, 0, 0); // right turn
+            }
+            else {
+                executionFailed(); // Error state
+            }
+
+            delayMs(30);
+            DHB1_setMotorSpeeds(&pmodDHB1, 35, 35);
+
+            doOnce = 1;
+        }
+
+        switch (lineDetectionState) {
+            case LEFT_LINE_DETECTED:
+                // Rotate left until no longer detecting line
+                while(!readInfraredSensor(LEFT_SENSOR)) {
+                    
+                }
+                if (!readInfraredSensor(LEFT_SENSOR)) { // A way to get a simple debounce
+                    break;
+                }
+                // Stop
+                DHB1_setMotorSpeeds(&pmodDHB1, 0, 0);
+                delayMs(50);
+                // Start turning right until right sensor detects line
+                DHB1_setDirs(&pmodDHB1, 0, 0);
+                delayMs(30);
+                DHB1_setMotorSpeeds(&pmodDHB1, 35, 35);
+                // Start timer
+                unsigned long int startTime = globalTimestamp;
+                
+                while (!readInfraredSensor(RIGHT_SENSOR)) {
+                    // wait
+                }
+                unsigned long int elapsedTime = globalTimestamp - startTime;
+
+                // Stop
+                DHB1_setMotorSpeeds(&pmodDHB1, 0, 0);
+                // Rotate left for half that time
+                delayMs(50);
+                DHB1_setDirs(&pmodDHB1, 1, 1);
+                delayMs(30);
+                DHB1_setMotorSpeeds(&pmodDHB1, 35, 35);
+                unsigned long int targetTime = globalTimestamp + (elapsedTime / 2);
+                while (globalTimestamp < targetTime) {
+                    // wait
+                }
+                DHB1_setMotorSpeeds(&pmodDHB1, 0, 0); // stop
+                delayMs(50);
+                DHB1_setDirs(&pmodDHB1, 0, 1); // set forward
+                *rgbLEDsData = RGB_LED_ALL_GREEN;
+                delayMs(200);
+                break;
+
+            case RIGHT_LINE_DETECTED:
+                // Rotate right until no longer detecting line
+                while(!readInfraredSensor(RIGHT_SENSOR)) {
+                    
+                }
+                if (!readInfraredSensor(RIGHT_SENSOR)) { // A way to get a simple debounce
+                    break;
+                }
+                // Stop
+                DHB1_setMotorSpeeds(&pmodDHB1, 0, 0);
+                delayMs(50);
+                // Start turning left until left sensor detects line
+                DHB1_setDirs(&pmodDHB1, 1, 1);
+                delayMs(30);
+                DHB1_setMotorSpeeds(&pmodDHB1, 35, 35);
+                // Start timer
+                unsigned long int startTime = globalTimestamp;
+                
+                while (!readInfraredSensor(LEFT_SENSOR)) {
+                    // wait
+                }
+                unsigned long int elapsedTime = globalTimestamp - startTime;
+
+                // Stop
+                DHB1_setMotorSpeeds(&pmodDHB1, 0, 0);
+                // Rotate right for half that time
+                delayMs(50);
+                DHB1_setDirs(&pmodDHB1, 0, 0);
+                delayMs(30);
+                DHB1_setMotorSpeeds(&pmodDHB1, 35, 35);
+                unsigned long int targetTime = globalTimestamp + (elapsedTime / 2);
+                while (globalTimestamp < targetTime) {
+                    // wait
+                }
+                DHB1_setMotorSpeeds(&pmodDHB1, 0, 0); // stop
+                delayMs(50);
+                DHB1_setDirs(&pmodDHB1, 0, 1); // set forward
+                *rgbLEDsData = RGB_LED_ALL_GREEN;
+                delayMs(200);
+                break;
+
+            default:
+                executionFailed(); // Error state
+                break;
+        }
+
+        doOnce = 1;
+        state = LINE_FOLLOWING;
+        }
+        break;
+
     case LINE_FOLLOWING:
+        if (!doOnce) {
+            DHB1_setMotorSpeeds(&pmodDHB1, 50, 50);
+            doOnce = 1;
+        }
+
+        // Read infrared sensors
+        leftSensor = readInfraredSensor(LEFT_SENSOR);
+        rightSensor = readInfraredSensor(RIGHT_SENSOR);
+
+        // Left turn if left sensor detects line
+        if (leftSensor && !rightSensor) {
+            DHB1_setMotorSpeeds(&pmodDHB1, 30, 50);
+            *rgbLEDsData = (RGB_LD0 & RGB_LED_ALL_BLUE);
+        }
+        // Right turn if right sensor detects line
+        else if (!leftSensor && rightSensor) {
+            DHB1_setMotorSpeeds(&pmodDHB1, 50, 30);
+            *rgbLEDsData = (RGB_LD3 & RGB_LED_ALL_BLUE);
+        }
+        // If neither sensor detects line, go straight
+        else if (!leftSensor && !rightSensor) {
+            // Both sensors detect line, go straight
+            DHB1_setMotorSpeeds(&pmodDHB1, 50, 50);
+            *rgbLEDsData = ((RGB_LD0 | RGB_LD3) & RGB_LED_ALL_GREEN);
+        }
+        // If both sensors detect line, set LEDs to yellow
+        else {
+            // No line detected, stop
+            //DHB1_setMotorSpeeds(&pmodDHB1, 0, 0);
+            *rgbLEDsData = (RGB_LED_ALL_RED | RGB_LED_ALL_GREEN);
+        }
+
+        sonarDist = getSonarDistance();
+        if (sonarDist < SONAR_THRESHOLD_VALUE) {
+            state = SONAR_STOPPED;
+            doOnce = 0;
+        }
+        delayMs(5); // small delay to avoid excessive looping
         break;
 
     case SONAR_STOPPED:
+        // Stop the motors
+        DHB1_setMotorSpeeds(&pmodDHB1, 0, 0);
+        // Set LEDs to all red
+        *rgbLEDsData = RGB_LED_ALL_RED;
+
+        executionFailed(); // Stop execution for now
         break;
     
     default:
         break;
 
-  } 
 }
 
 
